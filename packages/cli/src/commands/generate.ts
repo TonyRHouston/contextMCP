@@ -197,7 +197,9 @@ async function generateCommand(options: GenerateOptions): Promise<void> {
       const repoLink = terminalLink(projectId, sourceUrl, pc.white);
 
       const starsLine =
-        lib.stars && isGitHub ? [`${pc.yellow("Stars:")}       ${lib.stars.toLocaleString()}`] : [];
+        lib.stars && lib.stars > 0 && isGitHub
+          ? [`${pc.yellow("Stars:")}       ${lib.stars.toLocaleString()}`]
+          : [];
 
       const metadataLines = [
         pc.dim("─".repeat(50)),
