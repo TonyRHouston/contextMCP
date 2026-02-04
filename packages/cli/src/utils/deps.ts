@@ -1,4 +1,4 @@
-import { readFile } from "fs/promises";
+import { readFile, readdir } from "fs/promises";
 import { join } from "path";
 
 async function readFileOrNull(path: string): Promise<string | null> {
@@ -9,7 +9,6 @@ async function readFileOrNull(path: string): Promise<string | null> {
   }
 }
 
-/** Basic client-side filter. The real SKIP_SET lives on the backend. */
 function isSkippedLocally(name: string): boolean {
   return name.startsWith("@types/");
 }
@@ -21,12 +20,17 @@ async function parsePackageJson(cwd: string): Promise<string[]> {
   try {
     const pkg = JSON.parse(content);
     const names = new Set<string>();
+    const depTypes = [
+      "dependencies",
+      "devDependencies",
+      "optionalDependencies",
+      "peerDependencies",
+    ];
 
-    for (const key of Object.keys(pkg.dependencies || {})) {
-      if (!isSkippedLocally(key)) names.add(key);
-    }
-    for (const key of Object.keys(pkg.devDependencies || {})) {
-      if (!isSkippedLocally(key)) names.add(key);
+    for (const type of depTypes) {
+      for (const key of Object.keys(pkg[type] || {})) {
+        if (!isSkippedLocally(key)) names.add(key);
+      }
     }
 
     return [...names];
@@ -44,9 +48,7 @@ async function parseRequirementsTxt(cwd: string): Promise<string[]> {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("-")) continue;
     const name = trimmed.split(/[=<>!~;@\s\[]/)[0].trim();
-    if (name && !isSkippedLocally(name)) {
-      deps.push(name);
-    }
+    if (name && !isSkippedLocally(name)) deps.push(name);
   }
   return deps;
 }
@@ -75,8 +77,7 @@ async function parsePyprojectToml(cwd: string): Promise<string[]> {
 
   const poetryMatch = content.match(/\[tool\.poetry\.dependencies\]([\s\S]*?)(?:\n\[|$)/);
   if (poetryMatch) {
-    const lines = poetryMatch[1].split("\n");
-    for (const line of lines) {
+    for (const line of poetryMatch[1].split("\n")) {
       const match = line.match(/^(\S+)\s*=/);
       if (match) {
         const name = match[1].trim();
@@ -97,6 +98,57 @@ export async function detectProjectDependencies(cwd: string): Promise<string[]> 
     parseRequirementsTxt(cwd),
     parsePyprojectToml(cwd),
   ]);
-
   return [...new Set(results.flat())];
+}
+
+async function parseLockfileDeps(cwd: string): Promise<string[] | null> {
+  const content = await readFileOrNull(join(cwd, "package-lock.json"));
+  if (!content) return null;
+
+  try {
+    const lock = JSON.parse(content);
+    const rootPkg = lock.packages?.[""];
+    if (rootPkg) {
+      const deps = [
+        ...Object.keys(rootPkg.dependencies || {}),
+        ...Object.keys(rootPkg.devDependencies || {}),
+        ...Object.keys(rootPkg.optionalDependencies || {}),
+      ];
+      return deps.filter((d) => !isSkippedLocally(d));
+    }
+  } catch {}
+  return null;
+}
+
+export async function detectNewlyInstalledPackages(cwd: string): Promise<string[]> {
+  const declaredDeps = await parsePackageJson(cwd);
+  const declaredSet = new Set(declaredDeps);
+  const nodeModulesPath = join(cwd, "node_modules");
+
+  try {
+    const entries = await readdir(nodeModulesPath);
+    const isPnpm = entries.includes(".pnpm");
+
+    if (isPnpm) {
+      const regularPackages = entries.filter((e) => !e.startsWith(".") && !e.startsWith("@"));
+      const scopedPackages: string[] = [];
+
+      for (const scope of entries.filter((e) => e.startsWith("@"))) {
+        try {
+          const packages = await readdir(join(nodeModulesPath, scope));
+          for (const pkg of packages) {
+            if (!pkg.startsWith(".")) scopedPackages.push(`${scope}/${pkg}`);
+          }
+        } catch {}
+      }
+
+      const installed = [...regularPackages, ...scopedPackages];
+      return installed.filter((pkg) => !declaredSet.has(pkg) && !isSkippedLocally(pkg));
+    } else {
+      const lockfileDeps = await parseLockfileDeps(cwd);
+      return lockfileDeps ? lockfileDeps.filter((pkg) => !declaredSet.has(pkg)) : [];
+    }
+  } catch {
+    return [];
+  }
 }
